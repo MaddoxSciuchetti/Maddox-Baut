@@ -2,15 +2,15 @@ import express, { type Express } from "express";
 import fs from "fs";
 import path, { dirname } from "path";
 import { fileURLToPath } from "url";
-import { createServer as createViteServer, createLogger, type ViteDevServer } from "vite";
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-import { type Server } from "http";
+import { createServer as createViteServer, type InlineConfig } from "vite";
+import type { Server } from "http";
 import viteConfig from "../vite.config";
 import { nanoid } from "nanoid";
 
-const viteLogger = createLogger();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
+// Simple logging utility
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
     hour: "numeric",
@@ -23,68 +23,90 @@ export function log(message: string, source = "express") {
 }
 
 export async function setupVite(app: Express, server: Server) {
-  const vite = await createViteServer({
-    ...viteConfig,
-    configFile: false,
-    customLogger: {
-      ...viteLogger,
-      error: (msg, options) => {
-        viteLogger.error(msg, options);
-        process.exit(1);
+  try {
+    // Create Vite server in middleware mode
+    const viteDevConfig: InlineConfig = {
+      ...viteConfig,
+      configFile: false,
+      server: {
+        middlewareMode: true,
+        hmr: {
+          server
+        },
       },
-    },
-    server: {
-      middlewareMode: true as const,
-      hmr: {
-        server,
-        protocol: 'ws',
-        host: 'localhost'
-      },
-      host: 'localhost'
-    },
-    appType: "custom",
-  });
+      appType: "custom",
+      logLevel: "info"
+    };
 
-  app.use(vite.middlewares);
-  app.use("*", async (req, res, next) => {
-    const url = req.originalUrl;
+    const vite = await createViteServer(viteDevConfig);
 
-    try {
-      const clientTemplate = path.resolve(
-        __dirname,
-        "..",
-        "client",
-        "index.html",
-      );
+    // Use Vite's middlewares
+    app.use(vite.middlewares);
+    
+    // Handle * route for client-side rendering
+    app.use("*", async (req, res, next) => {
+      const url = req.originalUrl;
 
-      // always reload the index.html file from disk incase it changes
-      let template = await fs.promises.readFile(clientTemplate, "utf-8");
-      template = template.replace(
-        `src="/src/main.tsx"`,
-        `src="/src/main.tsx?v=${nanoid()}"`,
-      );
-      const page = await vite.transformIndexHtml(url, template);
-      res.status(200).set({ "Content-Type": "text/html" }).end(page);
-    } catch (e) {
-      vite.ssrFixStacktrace(e as Error);
-      next(e);
-    }
-  });
+      try {
+        // Get the path to the index HTML
+        const clientTemplate = path.resolve(
+          __dirname,
+          "..",
+          "client",
+          "index.html",
+        );
+
+        // Read the template
+        let template = await fs.promises.readFile(clientTemplate, "utf-8");
+        
+        // Add a version query param to prevent caching
+        template = template.replace(
+          `src="/src/main.tsx"`,
+          `src="/src/main.tsx?v=${nanoid()}"`,
+        );
+        
+        // Transform the HTML with Vite
+        const page = await vite.transformIndexHtml(url, template);
+        
+        res.status(200).set({ "Content-Type": "text/html" }).end(page);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+
+    log("Vite middleware setup complete", "vite");
+  } catch (error) {
+    console.error("Error setting up Vite:", error);
+    throw error;
+  }
 }
 
 export function serveStatic(app: Express) {
-  const distPath = path.resolve(__dirname, "public");
+  // For production mode
+  const distPath = path.resolve(__dirname, "..", "dist", "public");
 
   if (!fs.existsSync(distPath)) {
-    throw new Error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`,
-    );
+    console.warn(`Build directory not found: ${distPath}`);
+    // We'll create it if it doesn't exist - useful for Vercel
+    fs.mkdirSync(distPath, { recursive: true });
   }
 
-  app.use(express.static(distPath));
+  // Serve static files
+  app.use(express.static(distPath, {
+    index: false // Don't serve index.html on directory access
+  }));
 
-  // fall through to index.html if the file doesn't exist
+  // Fall through to index.html for SPAs
   app.use("*", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+    const indexPath = path.resolve(distPath, "index.html");
+    
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      res.status(404).send("Application not built. Please build the client first.");
+    }
   });
+
+  log("Static file serving setup for production", "express");
 }
